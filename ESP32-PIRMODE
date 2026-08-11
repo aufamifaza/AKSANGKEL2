@@ -1,0 +1,199 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <UniversalTelegramBot.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+
+// CONFIG WI-FI
+const char* ssid = "AksangKel2";
+const char* password = "qqqqqqqq";
+
+// CONFIG MQTT
+const char* mqtt_server = "rmq230.pptik.id";
+const int mqtt_port = 1883;
+const char* mqtt_user = "/prd:prd26-kel11";
+const char* mqtt_pass = "Smart123System";
+const char* mqtt_topic = "Trigger";
+
+// CONFIG TELEGRAM
+#define BOTtoken "8609376337:AAFM-5u5YmcfEKwlL6zdaxexBgknNYo7IxI"
+#define CHAT_ID "7416287973"
+
+// PIN
+#define BUZZER_PIN 14
+#define PIR_PIN    12
+
+Adafruit_MPU6050 mpu;
+
+const float MPU_THRESHOLD = 14.0; 
+
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+
+WiFiClientSecure telegramClient;
+UniversalTelegramBot bot(BOTtoken, telegramClient);
+
+unsigned long pirCooldown = 0;
+unsigned long mpuCooldown = 0;
+unsigned long buzzerTurnOffTime = 0;
+
+bool triggerPending = false;
+bool buzzerActive = false;
+
+// Variable Kontrol Status PIR (Default: Aktif)
+bool pirEnabled = true;
+
+// Fungsi Mengirim Pesan Telegram
+void sendTelegramMsg(String message) {
+  telegramClient.setInsecure(); 
+  bot.sendMessage(CHAT_ID, message, "");
+}
+
+// Callback pesan MQTT
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  Serial.print("[MQTT Received] Topic: ");
+  Serial.print(topic);
+  Serial.print(" | Message: ");
+  Serial.println(message);
+
+  // Kontrol Sinyal AI Deteksi Sampah
+  if (message == "TRIGGER") {
+    triggerPending = true;
+  }
+  // Kontrol Mode Sensor PIR dari MQTTBox
+  else if (message == "PIR_OFF") {
+    pirEnabled = false;
+    Serial.println("[PIR STATUS] NONAKTIF!");
+    sendTelegramMsg("Mode Pameran: Sensor PIR DINONAKTIFKAN.");
+  }
+  else if (message == "PIR_ON") {
+    pirEnabled = true;
+    Serial.println("[PIR STATUS] AKTIF!");
+    sendTelegramMsg("Sensor PIR DIAKTIFKAN kembali.");
+  }
+}
+
+// Fungsi Reconnect MQTT
+void reconnectMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("Mencoba konek ke Broker PPTIK (rmq230.pptik.id)...");
+    
+    String clientId = "ESP32Aktuator-";
+    clientId += String(random(0xffff), HEX);
+
+    if (mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
+      Serial.println(" Terhubung!");
+      mqttClient.subscribe(mqtt_topic);
+      Serial.print("Subscribed ke topic: ");
+      Serial.println(mqtt_topic);
+    } else {
+      Serial.print(" Gagal, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" Mencoba lagi dalam 3 detik...");
+      delay(3000);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(PIR_PIN, INPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Inisialisasi MPU6050
+  Wire.begin(); 
+  if (!mpu.begin()) {
+    Serial.println("Gagal menemukan sensor MPU6050!");
+  } else {
+    Serial.println("Sensor MPU6050 berhasil diinisialisasi.");
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+
+  // Konek Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected!");
+  Serial.print("ESP32 Aktuator IP: ");
+  Serial.println(WiFi.localIP());
+
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
+}
+
+void loop() {
+  // MQTT keeper
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+  mqttClient.loop();
+
+  unsigned long currentMillis = millis();
+
+  // 1. TRIGGER MQTT [SAMPAH AI]
+  if (triggerPending) {
+    triggerPending = false;
+    
+    digitalWrite(BUZZER_PIN, HIGH);
+    buzzerActive = true;
+    buzzerTurnOffTime = currentMillis + 500;
+    Serial.println("Buzzer Hidup (Sampah AI)");
+
+    Serial.println("Telegram masuk (Sampah AI)");
+    sendTelegramMsg("[AI CCTV] Sampah terdeteksi! [Lokasi: Aula barat]");
+  }
+
+  // 2. SENSOR MPU6050
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  float totalAccel = sqrt(a.acceleration.x * a.acceleration.x +
+                          a.acceleration.y * a.acceleration.y +
+                          a.acceleration.z * a.acceleration.z);
+
+  if (totalAccel > MPU_THRESHOLD && (currentMillis - mpuCooldown > 5000)) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    buzzerActive = true;
+    buzzerTurnOffTime = currentMillis + 400;
+    Serial.println("Buzzer hidup (MPU6050 Getaran)");
+
+    Serial.println("Telegram masuk (MPU6050)");
+    sendTelegramMsg("[MPU6050] Terdeteksi guncangan!");
+    mpuCooldown = currentMillis;
+  }
+
+  // 3. SENSOR PIR (pirEnabled == true)
+  if (pirEnabled) {
+    if (digitalRead(PIR_PIN) == HIGH && (currentMillis - pirCooldown > 5000)) {
+      digitalWrite(BUZZER_PIN, HIGH);
+      buzzerActive = true;
+      buzzerTurnOffTime = currentMillis + 200; 
+      Serial.println("Buzzer hidup (PIR)");
+
+      Serial.println("Telegram masuk (PIR)");
+      sendTelegramMsg("[PIR] Gerakan terdeteksi!");
+      pirCooldown = currentMillis;
+    }
+  }
+
+  // 4. BUZZER OFF
+  if (buzzerActive && currentMillis >= buzzerTurnOffTime) {
+    digitalWrite(BUZZER_PIN, LOW);
+    Serial.println("Buzzer Mati");
+    buzzerActive = false;
+  }
+
+  delay(50); 
